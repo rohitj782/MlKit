@@ -2,6 +2,7 @@ package com.rohitrj.mlkit
 
 import android.app.Activity
 import android.content.Context
+import android.content.res.AssetManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import androidx.appcompat.app.AppCompatActivity
@@ -11,6 +12,12 @@ import android.util.Pair
 import android.view.View
 import android.widget.*
 import com.google.android.gms.tasks.OnSuccessListener
+import com.google.firebase.ml.common.FirebaseMLException
+import com.google.firebase.ml.common.modeldownload.FirebaseLocalModel
+import com.google.firebase.ml.common.modeldownload.FirebaseModelDownloadConditions
+import com.google.firebase.ml.common.modeldownload.FirebaseModelManager
+import com.google.firebase.ml.common.modeldownload.FirebaseRemoteModel
+import com.google.firebase.ml.custom.*
 import com.google.firebase.ml.vision.FirebaseVision
 import com.google.firebase.ml.vision.common.FirebaseVisionImage
 import com.google.firebase.ml.vision.document.FirebaseVisionDocumentText
@@ -19,15 +26,15 @@ import com.google.firebase.ml.vision.face.FirebaseVisionFaceDetector
 import com.google.firebase.ml.vision.face.FirebaseVisionFaceDetectorOptions
 import com.google.firebase.ml.vision.text.FirebaseVisionText
 import com.google.firebase.ml.vision.text.FirebaseVisionTextRecognizer
-import java.io.BufferedReader
-import java.io.IOException
-import java.io.InputStream
-import java.io.InputStreamReader
+import java.io.*
+import java.lang.Exception
+import java.lang.StringBuilder
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.security.KeyStore
 import java.util.*
 import java.util.Map
+import kotlin.Comparator
 import kotlin.experimental.and
 
 @Suppress("RECEIVER_NULLABILITY_MISMATCH_BASED_ON_JAVA_ANNOTATIONS")
@@ -47,9 +54,18 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
     var mImageMaxHeight: Int? = null
 
     /**
+     * An instance of the driver class to run model inference with Firebase.
+     */
+    var mInterpreter: FirebaseModelInterpreter? = null
+    /**
+     * Data configuration of input & output data of model.
+     */
+    lateinit var mDataOptions: FirebaseModelInputOutputOptions
+
+    /**
      * Name of the model file hosted with Firebase.
      */
-    private val HOSTED_MODEL_NAME = "cloud_model_1"
+    private val HOSTED_MODEL_NAME = "mobilenet_v1_224_quant"
     private val LOCAL_MODEL_ASSET = "mobilenet_v1_1.0_224_quant.tflite"
     /**
      * Name of the label file stored in Assets.
@@ -69,12 +85,15 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
     /**
      * Labels corresponding to the output of the vision model.
      */
-    private val mLabelList: List<String>? = null
+    private var mLabelList: List<String>? = null
 
     private val sortedLabels = PriorityQueue<kotlin.collections.Map.Entry<String, Float>>(
         RESULTS_TO_SHOW,
-        Comparator<Any> { o1, o2 -> o1.toString().compareTo(o2.toString()) })
+        Comparator<kotlin.collections.Map.Entry<String, Float>>
+        { p0, p1 -> (p0!!.component2().compareTo(p1!!.component2())) }
+        )
     /* Preallocated buffers for storing image data. */
+
     private val intValues = IntArray(DIM_IMG_SIZE_X * DIM_IMG_SIZE_Y)
 
 
@@ -122,13 +141,12 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
     }
 
     private fun processTextRecognitionResult(texts: FirebaseVisionText) {
-
+        mGraphicOverlay.clear()
         val blocks: List<FirebaseVisionText.TextBlock> = texts.textBlocks
         if (blocks.isEmpty()) {
             showToast("No text found")
             return
         }
-        mGraphicOverlay.clear()
         for (i in blocks) {
             val lines: List<FirebaseVisionText.Line> = i.lines
             for (j in lines) {
@@ -146,33 +164,33 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
     private fun runFaceContourDetection() {
         val image: FirebaseVisionImage = FirebaseVisionImage.fromBitmap(mSelectedImage)
         val options: FirebaseVisionFaceDetectorOptions =
-            FirebaseVisionFaceDetectorOptions.Builder ()
+            FirebaseVisionFaceDetectorOptions.Builder()
                 .setPerformanceMode(FirebaseVisionFaceDetectorOptions.FAST)
                 .setContourMode(FirebaseVisionFaceDetectorOptions.ALL_CONTOURS)
                 .build()
 
         mFaceButton.isEnabled = false
-        val detector:FirebaseVisionFaceDetector = FirebaseVision.getInstance ()
+        val detector: FirebaseVisionFaceDetector = FirebaseVision.getInstance()
             .getVisionFaceDetector(options)
         detector.detectInImage(image)
             .addOnSuccessListener {
                 mFaceButton.setEnabled(true)
                 processFaceContourDetectionResult(it)
             }
-            .addOnFailureListener{
+            .addOnFailureListener {
                 mFaceButton.setEnabled(true)
             }
     }
 
     private fun processFaceContourDetectionResult(faces: List<FirebaseVisionFace>) {
-      // Task completed successfully
+        // Task completed successfully
+        mGraphicOverlay.clear()
         if (faces.isEmpty()) {
             showToast("No face found")
             return
         }
-        mGraphicOverlay.clear();
         for (i in faces) {
-            val face:FirebaseVisionFace = i
+            val face: FirebaseVisionFace = i
             val faceGraphic = FaceContourGraphic(mGraphicOverlay)
             mGraphicOverlay.add(faceGraphic)
             faceGraphic.updateFace(face)
@@ -180,11 +198,83 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
     }
 
     private fun initCustomModel() {
-        // Replace with code from the codelab to initialize your custom model
+
+        mLabelList = loadLabelList(this)
+        val inputDims = intArrayOf(DIM_BATCH_SIZE, DIM_IMG_SIZE_X, DIM_IMG_SIZE_Y, DIM_PIXEL_SIZE)
+        val outputDims = intArrayOf(DIM_BATCH_SIZE, mLabelList!!.size)
+
+        try {
+            mDataOptions = FirebaseModelInputOutputOptions.Builder()
+                .setInputFormat(0, FirebaseModelDataType.BYTE, inputDims)
+                .setOutputFormat(0, FirebaseModelDataType.BYTE, outputDims)
+                .build()
+
+            val conditions: FirebaseModelDownloadConditions = FirebaseModelDownloadConditions
+                .Builder()
+                .build()
+
+            val remoteModel: FirebaseRemoteModel = FirebaseRemoteModel.Builder(HOSTED_MODEL_NAME)
+                .enableModelUpdates(true)
+                .setInitialDownloadConditions(conditions)
+                .setUpdatesDownloadConditions(conditions)  // You could also specify
+                // different conditions
+                // for updates
+                .build()
+
+            val localModel: FirebaseLocalModel = FirebaseLocalModel.Builder("asset")
+                .setAssetFilePath(LOCAL_MODEL_ASSET).build()
+            val manager: FirebaseModelManager = FirebaseModelManager.getInstance()
+            manager.registerRemoteModel(remoteModel)
+            manager.registerLocalModel(localModel)
+            val modelOptions: FirebaseModelOptions = FirebaseModelOptions.Builder()
+                .setRemoteModelName(HOSTED_MODEL_NAME)
+                .setLocalModelName("asset")
+                .build()
+            mInterpreter = FirebaseModelInterpreter.getInstance(modelOptions)!!
+
+        } catch (e: FirebaseMLException) {
+            showToast("Error while setting up the model")
+            e.printStackTrace()
+        }
+
     }
 
     private fun runModelInference() {
-        // Replace with code from the codelab to run inference using your custom model.
+        mGraphicOverlay.clear()
+        if (mInterpreter == null) {
+            Log.e(TAG, "Image classifier has not been initialized; Skipped.")
+            return
+        }
+        // Create input data.
+        val imgData: ByteBuffer = convertBitmapToByteBuffer(
+            mSelectedImage, mSelectedImage.width,
+            mSelectedImage.height
+        )
+
+        try {
+            val inputs: FirebaseModelInputs = FirebaseModelInputs.Builder()
+                .add(imgData).build()
+            // Here's where the magic happens!!
+            mInterpreter!!.run(inputs, mDataOptions)
+                .addOnFailureListener {
+                    it.printStackTrace()
+                    showToast("Error running model inference")
+                }
+                .continueWith {
+//                    Log.i(TAG,it.result!!.getOutput(0))
+                    val labelProbArray: Array<ByteArray> = it.result!!.getOutput(0)
+                    val topLabels: List<String> = getTopLabels(labelProbArray)
+                    val labelGraphic: GraphicOverlay.Graphic =
+                        LabelGraphic(mGraphicOverlay, topLabels)
+                    mGraphicOverlay.add(labelGraphic)
+                    return@continueWith topLabels
+                }
+        } catch (e: FirebaseMLException) {
+            e.printStackTrace()
+            showToast("Error  exception running model inference")
+        }
+
+
     }
 
     private fun runCloudTextRecognition() {
@@ -201,10 +291,13 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
     @Synchronized
     private fun getTopLabels(labelProbArray: Array<ByteArray>): List<String> {
         if (mLabelList != null) {
-            for (i in mLabelList.indices) {
+            for (i in mLabelList!!.indices) {
+                val prob = (labelProbArray[0][i] and 0xff.toByte())/255.0f
+                Log.i(TAG, "${mLabelList!![i]} :: $prob")
+
                 sortedLabels.add(
                     AbstractMap.SimpleEntry(
-                        mLabelList.get(i),
+                        mLabelList!![i],
                         (labelProbArray[0][i] and 0xff.toByte()) / 255.0f
                     )
                 )
@@ -219,7 +312,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
             val label = sortedLabels.poll()
             result.add(label.key + ":" + label.value)
         }
-        Log.d(TAG, "labels: $result")
+        Log.i(TAG, "labels: $result")
         return result
     }
 
@@ -228,19 +321,21 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener {
      */
     private fun loadLabelList(activity: Activity): List<String> {
         val labelList = ArrayList<String>()
+        val assetManager: AssetManager = resources.assets
+        var inputStream: InputStream? = null
         try {
-            BufferedReader(InputStreamReader(activity.assets.open(LABEL_PATH))).use { reader ->
-                val line: String? = reader.readLine()
-                while (line != null) {
-                    labelList.add(line)
-                }
+            inputStream = assetManager.open(LABEL_PATH)
+            val s = Scanner(inputStream)
+            while(s.hasNext()){
+                labelList.add( s.nextLine() )
             }
-        } catch (e: IOException) {
-            Log.e(TAG, "Failed to read label list.", e)
-        }
 
+        } catch (e: IOException) {
+            e.printStackTrace()
+        }
         return labelList
     }
+
 
     /**
      * Writes Image data into a `ByteBuffer`.
